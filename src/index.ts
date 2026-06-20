@@ -19,6 +19,14 @@ type TelegramUpdate = {
 	update_id: number;
 	message?: {
 		chat?: { id?: number };
+		text?: string;
+	};
+	callback_query?: {
+		id?: string;
+		data?: string;
+		message?: {
+			chat?: { id?: number };
+		};
 	};
 };
 type TelegramApiResponse<T> = {
@@ -31,6 +39,7 @@ type TelegramApiResponse<T> = {
 const UUID_REGEX =
 	/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const TELEGRAM_OFFSET_KEY = "telegram_polling_offset";
+const TELEGRAM_GET_BOARDS_BUTTON = "boards";
 
 const ROLE_KEYWORDS: Array<{ keywords: string[]; roles: string[] }> = [
 	{ keywords: ["api", "backend", "server", "db", "database"], roles: ["backend"] },
@@ -113,8 +122,165 @@ async function callTelegramApi<T>(
 	return responseBody;
 }
 
+function getTelegramKeyboard(): { keyboard: Array<Array<{ text: string }>>; resize_keyboard: boolean } {
+	return {
+		keyboard: [[{ text: TELEGRAM_GET_BOARDS_BUTTON }]],
+		resize_keyboard: true,
+	};
+}
+
+async function loadBoards(
+	env: Env & { SUPABASE_URL?: string; SUPABASE_SERVICE_ROLE_KEY?: string },
+): Promise<{ boards: Array<{ id: string; name: string }>; error: string | null }> {
+	const supabaseUrl = env.SUPABASE_URL;
+	const supabaseServiceRoleKey = env.SUPABASE_SERVICE_ROLE_KEY;
+	if (!supabaseUrl || !supabaseServiceRoleKey) {
+		return {
+			boards: [],
+			error: "Не настроено подключение к Supabase (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY).",
+		};
+	}
+
+	const supabase = createClient(supabaseUrl, supabaseServiceRoleKey, {
+		auth: { persistSession: false },
+	});
+	const { data: boards, error } = await supabase
+		.from("boards")
+		.select("id, name")
+		.order("created_at", { ascending: true });
+	if (error) {
+		console.error("Failed to fetch boards from Supabase:", error);
+		return {
+			boards: [],
+			error: "Не получилось получить доски из базы данных.",
+		};
+	}
+
+	return {
+		boards: (boards ?? []) as Array<{ id: string; name: string }>,
+		error: null,
+	};
+}
+
+function getBoardsInlineKeyboard(
+	boards: Array<{ id: string; name: string }>,
+): { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> } {
+	return {
+		inline_keyboard: boards.map((board) => [
+			{ text: board.name, callback_data: `board:${board.id}` },
+		]),
+	};
+}
+
+async function listBoardTasksMessage(
+	env: Env & { SUPABASE_URL?: string; SUPABASE_SERVICE_ROLE_KEY?: string },
+	boardId: string,
+): Promise<string> {
+	const supabaseUrl = env.SUPABASE_URL;
+	const supabaseServiceRoleKey = env.SUPABASE_SERVICE_ROLE_KEY;
+	if (!supabaseUrl || !supabaseServiceRoleKey) {
+		return "Не настроено подключение к Supabase (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY).";
+	}
+
+	const supabase = createClient(supabaseUrl, supabaseServiceRoleKey, {
+		auth: { persistSession: false },
+	});
+	const { data: tasks, error } = await supabase
+		.from("tasks")
+		.select("title, status")
+		.eq("board_id", boardId)
+		.order("created_at", { ascending: true });
+	if (error) {
+		console.error("Failed to fetch tasks from Supabase:", error);
+		return "Не получилось получить задачи для выбранной доски.";
+	}
+
+	if (!tasks || tasks.length === 0) {
+		return "На выбранной доске пока нет задач.";
+	}
+
+	const lines = tasks.map(
+		(task, index) => `${index + 1}. ${task.title}${task.status ? ` [${task.status}]` : ""}`,
+	);
+	return `Задачи на доске:\n${lines.join("\n")}`;
+}
+
+async function sendTelegramMessage(
+	botToken: string,
+	chatId: number,
+	text: string,
+	replyMarkup?: Record<string, unknown>,
+): Promise<void> {
+	await callTelegramApi(botToken, "sendMessage", {
+		chat_id: chatId,
+		text,
+		reply_markup: replyMarkup,
+	});
+}
+
+async function respondToTelegramUpdate(
+	botToken: string,
+	update: TelegramUpdate,
+	env: Env & { SUPABASE_URL?: string; SUPABASE_SERVICE_ROLE_KEY?: string },
+): Promise<void> {
+	const callbackQueryId = update.callback_query?.id;
+	const callbackChatId = update.callback_query?.message?.chat?.id;
+	const callbackData = update.callback_query?.data?.trim();
+	if (typeof callbackChatId === "number" && callbackData?.startsWith("board:")) {
+		const boardId = callbackData.slice("board:".length);
+		const tasksMessage = await listBoardTasksMessage(env, boardId);
+		await sendTelegramMessage(botToken, callbackChatId, tasksMessage, getTelegramKeyboard());
+		if (callbackQueryId) {
+			await callTelegramApi(botToken, "answerCallbackQuery", {
+				callback_query_id: callbackQueryId,
+			});
+		}
+		return;
+	}
+
+	const chatId = update.message?.chat?.id;
+	if (typeof chatId !== "number") {
+		return;
+	}
+
+	const normalizedText = update.message?.text?.trim();
+	const wantsBoards =
+		normalizedText === TELEGRAM_GET_BOARDS_BUTTON || normalizedText === "/boards";
+	if (!wantsBoards) {
+		await sendTelegramMessage(
+			botToken,
+			chatId,
+			"Нажмите кнопку boards, чтобы получить список досок.",
+			getTelegramKeyboard(),
+		);
+		return;
+	}
+
+	const { boards, error } = await loadBoards(env);
+	if (error) {
+		await sendTelegramMessage(botToken, chatId, error, getTelegramKeyboard());
+		return;
+	}
+	if (boards.length === 0) {
+		await sendTelegramMessage(botToken, chatId, "В базе пока нет досок.", getTelegramKeyboard());
+		return;
+	}
+
+	await sendTelegramMessage(
+		botToken,
+		chatId,
+		"Выберите доску:",
+		getBoardsInlineKeyboard(boards),
+	);
+}
+
 async function runTelegramPolling(
-	env: Env & { TELEGRAM_BOT_TOKEN?: string; TELEGRAM_STATE?: KVNamespace },
+	env: Env & {
+		TELEGRAM_BOT_TOKEN?: string;
+		TELEGRAM_STATE?: KVNamespace;
+		SUPABASE_URL?: string;
+		SUPABASE_SERVICE_ROLE_KEY?: string;
+	},
 ): Promise<void> {
 	const botToken = env.TELEGRAM_BOT_TOKEN;
 	const stateStore = env.TELEGRAM_STATE;
@@ -133,7 +299,7 @@ async function runTelegramPolling(
 
 	const updatesResponse = await callTelegramApi<TelegramUpdate[]>(botToken, "getUpdates", {
 		offset: safeOffset,
-		allowed_updates: ["message"],
+		allowed_updates: ["message", "callback_query"],
 		limit: 100,
 		timeout: 0,
 	});
@@ -142,18 +308,8 @@ async function runTelegramPolling(
 	let nextOffset = safeOffset;
 	for (const update of updates) {
 		const updateNextOffset = update.update_id + 1;
-		const chatId = update.message?.chat?.id;
-
-		if (typeof chatId !== "number") {
-			nextOffset = updateNextOffset;
-			continue;
-		}
-
 		try {
-			await callTelegramApi(botToken, "sendMessage", {
-				chat_id: chatId,
-				text: "ok",
-			});
+			await respondToTelegramUpdate(botToken, update, env);
 			nextOffset = updateNextOffset;
 		} catch (error) {
 			console.error("Failed to send Telegram reply:", error);
@@ -186,17 +342,15 @@ export default {
 				return Response.json({ ok: true });
 			}
 
-			const chatId = update.message?.chat?.id;
-			if (typeof chatId === "number") {
-				ctx.waitUntil(
-					callTelegramApi(botToken, "sendMessage", {
-						chat_id: chatId,
-						text: "ok",
-					}).catch((error) => {
-						console.error("Failed to send webhook reply:", error);
-					}),
-				);
-			}
+			ctx.waitUntil(
+				respondToTelegramUpdate(
+					botToken,
+					update,
+					env as Env & { SUPABASE_URL?: string; SUPABASE_SERVICE_ROLE_KEY?: string },
+				).catch((error) => {
+					console.error("Failed to send webhook reply:", error);
+				}),
+			);
 
 			return Response.json({ ok: true });
 		}

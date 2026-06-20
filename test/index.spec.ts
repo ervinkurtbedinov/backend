@@ -24,6 +24,8 @@ const createMockEnv = () =>
 const mockSupabaseState = {
 	profiles: [] as Array<{ id: string; full_name: string | null; team_role: string | null }>,
 	boardMembers: [] as Array<{ user_id: string }>,
+	boards: [] as Array<{ id: string; name: string }>,
+	tasks: [] as Array<{ board_id: string; title: string; status: string | null }>,
 	insertedTaskIds: [] as string[],
 	failInsert: false,
 };
@@ -47,6 +49,16 @@ vi.mock("@supabase/supabase-js", () => ({
 
 			if (table === "tasks") {
 				return {
+					select: () => ({
+						eq: (boardId: string) => ({
+							order: async () => ({
+								data: mockSupabaseState.tasks
+									.filter((task) => task.board_id === boardId)
+									.map(({ title, status }) => ({ title, status })),
+								error: null,
+							}),
+						}),
+					}),
 					insert: () => ({
 						select: () => ({
 							single: async () => {
@@ -64,6 +76,14 @@ vi.mock("@supabase/supabase-js", () => ({
 								};
 							},
 						}),
+					}),
+				};
+			}
+
+			if (table === "boards") {
+				return {
+					select: () => ({
+						order: async () => ({ data: mockSupabaseState.boards, error: null }),
 					}),
 				};
 			}
@@ -301,13 +321,30 @@ describe("/chat endpoint", () => {
 });
 
 describe("Telegram polling", () => {
-	it("sends ok reply and persists next offset", async () => {
+	it("shows board buttons and returns tasks for selected board", async () => {
 		const originalFetch = globalThis.fetch;
 		const state = new Map<string, string>();
 		const getSpy = vi.fn(async (key: string) => state.get(key) ?? null);
 		const putSpy = vi.fn(async (key: string, value: string) => {
 			state.set(key, value);
 		});
+		mockSupabaseState.boards = [
+			{ id: "11111111-1111-4111-8111-111111111111", name: "Backend" },
+			{ id: "22222222-2222-4222-8222-222222222222", name: "Frontend" },
+		];
+		mockSupabaseState.tasks = [
+			{
+				board_id: "11111111-1111-4111-8111-111111111111",
+				title: "Сделать API",
+				status: "todo",
+			},
+			{
+				board_id: "11111111-1111-4111-8111-111111111111",
+				title: "Покрыть тестами",
+				status: "in_progress",
+			},
+		];
+		let sendMessageCalls = 0;
 
 		const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
 			const requestUrl = input instanceof Request ? input.url : input.toString();
@@ -316,20 +353,57 @@ describe("Telegram polling", () => {
 				return new Response(
 					JSON.stringify({
 						ok: true,
-						result: [{ update_id: 7, message: { chat: { id: 12345 } } }],
+						result: [
+							{
+								update_id: 7,
+								message: { chat: { id: 12345 }, text: "boards" },
+							},
+							{
+								update_id: 8,
+								callback_query: {
+									id: "cb-1",
+									data: "board:11111111-1111-4111-8111-111111111111",
+									message: { chat: { id: 12345 } },
+								},
+							},
+						],
 					}),
 					{ status: 200, headers: { "Content-Type": "application/json" } },
 				);
 			}
 
 			if (requestUrl.includes("/sendMessage")) {
+				sendMessageCalls += 1;
 				const body = JSON.parse(typeof init?.body === "string" ? init.body : "{}") as {
 					chat_id?: number;
 					text?: string;
+					reply_markup?: {
+						inline_keyboard?: Array<Array<{ text?: string; callback_data?: string }>>;
+					};
 				};
 				expect(body.chat_id).toBe(12345);
-				expect(body.text).toBe("ok");
+				if (sendMessageCalls === 1) {
+					expect(body.text).toBe("Выберите доску:");
+					const firstButton = body.reply_markup?.inline_keyboard?.[0]?.[0];
+					expect(firstButton?.text).toBe("Backend");
+					expect(firstButton?.callback_data).toBe("board:11111111-1111-4111-8111-111111111111");
+				} else {
+					expect(body.text).toContain("Задачи на доске:");
+					expect(body.text).toContain("Сделать API");
+					expect(body.text).toContain("Покрыть тестами");
+				}
 				return new Response(JSON.stringify({ ok: true, result: { message_id: 1 } }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+
+			if (requestUrl.includes("/answerCallbackQuery")) {
+				const body = JSON.parse(typeof init?.body === "string" ? init.body : "{}") as {
+					callback_query_id?: string;
+				};
+				expect(body.callback_query_id).toBe("cb-1");
+				return new Response(JSON.stringify({ ok: true, result: true }), {
 					status: 200,
 					headers: { "Content-Type": "application/json" },
 				});
@@ -355,9 +429,9 @@ describe("Telegram polling", () => {
 			);
 			await waitOnExecutionContext(ctx);
 
-			expect(fetchMock).toHaveBeenCalledTimes(2);
+			expect(fetchMock).toHaveBeenCalledTimes(4);
 			expect(getSpy).toHaveBeenCalledWith("telegram_polling_offset");
-			expect(putSpy).toHaveBeenCalledWith("telegram_polling_offset", "8");
+			expect(putSpy).toHaveBeenCalledWith("telegram_polling_offset", "9");
 		} finally {
 			globalThis.fetch = originalFetch;
 		}
