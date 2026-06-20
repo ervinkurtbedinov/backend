@@ -4,7 +4,7 @@ import {
 	waitOnExecutionContext,
 	SELF,
 } from "cloudflare:test";
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import worker from "../src/index";
 
 // For now, you'll need to do something like this to get a correctly-typed
@@ -26,9 +26,26 @@ const mockSupabaseState = {
 	boardMembers: [] as Array<{ user_id: string }>,
 	boards: [] as Array<{ id: string; name: string }>,
 	tasks: [] as Array<{ board_id: string; title: string; status: string | null }>,
+	insertedTasks: [] as Array<{
+		board_id?: string;
+		title?: string;
+		status?: string;
+		priority?: string;
+		assignee_id?: string;
+	}>,
 	insertedTaskIds: [] as string[],
 	failInsert: false,
 };
+
+beforeEach(() => {
+	mockSupabaseState.profiles = [];
+	mockSupabaseState.boardMembers = [];
+	mockSupabaseState.boards = [];
+	mockSupabaseState.tasks = [];
+	mockSupabaseState.insertedTasks = [];
+	mockSupabaseState.insertedTaskIds = [];
+	mockSupabaseState.failInsert = false;
+});
 
 vi.mock("@supabase/supabase-js", () => ({
 	createClient: () => ({
@@ -59,7 +76,13 @@ vi.mock("@supabase/supabase-js", () => ({
 							}),
 						}),
 					}),
-					insert: () => ({
+					insert: (payload: {
+						board_id?: string;
+						title?: string;
+						status?: string;
+						priority?: string;
+						assignee_id?: string;
+					}) => ({
 						select: () => ({
 							single: async () => {
 								if (mockSupabaseState.failInsert) {
@@ -69,6 +92,7 @@ vi.mock("@supabase/supabase-js", () => ({
 									};
 								}
 
+								mockSupabaseState.insertedTasks.push(payload);
 								const nextId = mockSupabaseState.insertedTaskIds.shift() ?? "task-default";
 								return {
 									data: { id: nextId },
@@ -166,6 +190,10 @@ describe("/chat endpoint", () => {
 			expect(json.assignments.length).toBe(4);
 			expect(json.assignments[0]?.assignee.id).toBe("u1");
 			expect(json.assignments[0]?.task_id).toBe("t1");
+			expect(mockSupabaseState.insertedTasks.length).toBe(4);
+			expect(mockSupabaseState.insertedTasks[0]?.board_id).toBe(
+				"11111111-1111-4111-8111-111111111111",
+			);
 		} finally {
 			globalThis.fetch = originalFetch;
 		}
@@ -432,6 +460,146 @@ describe("Telegram polling", () => {
 			expect(fetchMock).toHaveBeenCalledTimes(4);
 			expect(getSpy).toHaveBeenCalledWith("telegram_polling_offset");
 			expect(putSpy).toHaveBeenCalledWith("telegram_polling_offset", "9");
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it("creates subtasks after message and board selection", async () => {
+		const originalFetch = globalThis.fetch;
+		const state = new Map<string, string>();
+		const getSpy = vi.fn(async (key: string) => state.get(key) ?? null);
+		const putSpy = vi.fn(async (key: string, value: string) => {
+			state.set(key, value);
+		});
+		mockSupabaseState.profiles = [
+			{ id: "u1", full_name: "Ivan Backend", team_role: "backend" },
+			{ id: "u2", full_name: "Nina QA", team_role: "qa" },
+		];
+		mockSupabaseState.boardMembers = [{ user_id: "u1" }, { user_id: "u2" }];
+		mockSupabaseState.boards = [
+			{ id: "11111111-1111-4111-8111-111111111111", name: "Backend" },
+			{ id: "22222222-2222-4222-8222-222222222222", name: "Frontend" },
+		];
+		mockSupabaseState.insertedTaskIds = ["task-1", "task-2"];
+		const sendMessages: string[] = [];
+
+		const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+			const requestUrl = input instanceof Request ? input.url : input.toString();
+
+			if (requestUrl.includes("/getUpdates")) {
+				return new Response(
+					JSON.stringify({
+						ok: true,
+						result: [
+							{
+								update_id: 10,
+								message: { chat: { id: 54321 }, text: "создание задач" },
+							},
+							{
+								update_id: 11,
+								message: {
+									chat: { id: 54321 },
+									text: "Нужно сделать API и покрыть тестами",
+								},
+							},
+							{
+								update_id: 12,
+								callback_query: {
+									id: "cb-create-1",
+									data: "create_tasks_board:11111111-1111-4111-8111-111111111111",
+									message: { chat: { id: 54321 } },
+								},
+							},
+						],
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}
+
+			if (requestUrl.includes("openrouter.ai/api/v1/chat/completions")) {
+				return new Response(
+					JSON.stringify({
+						choices: [
+							{
+								message: {
+									content:
+										'[{"task":"Сделать backend API"},{"task":"Покрыть backend API тестами"}]',
+								},
+							},
+						],
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}
+
+			if (requestUrl.includes("/sendMessage")) {
+				const body = JSON.parse(typeof init?.body === "string" ? init.body : "{}") as {
+					chat_id?: number;
+					text?: string;
+					reply_markup?: {
+						inline_keyboard?: Array<Array<{ text?: string; callback_data?: string }>>;
+					};
+				};
+				expect(body.chat_id).toBe(54321);
+				sendMessages.push(body.text ?? "");
+				if (body.text === "Выберите доску для создания задач:") {
+					const firstButton = body.reply_markup?.inline_keyboard?.[0]?.[0];
+					expect(firstButton?.text).toBe("Backend");
+					expect(firstButton?.callback_data).toBe(
+						"create_tasks_board:11111111-1111-4111-8111-111111111111",
+					);
+				}
+				return new Response(JSON.stringify({ ok: true, result: { message_id: 1 } }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+
+			if (requestUrl.includes("/answerCallbackQuery")) {
+				const body = JSON.parse(typeof init?.body === "string" ? init.body : "{}") as {
+					callback_query_id?: string;
+				};
+				expect(body.callback_query_id).toBe("cb-create-1");
+				return new Response(JSON.stringify({ ok: true, result: true }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+
+			throw new Error(`Unexpected fetch URL: ${requestUrl}`);
+		});
+
+		globalThis.fetch = fetchMock as typeof fetch;
+
+		try {
+			const ctx = createExecutionContext();
+			await worker.scheduled(
+				{ cron: "* * * * *", scheduledTime: Date.now() } as ScheduledController,
+				{
+					OPENROUTER_API_KEY: "test-key",
+					SUPABASE_URL: "https://example.supabase.co",
+					SUPABASE_SERVICE_ROLE_KEY: "service-role-key",
+					TELEGRAM_BOT_TOKEN: "test-bot-token",
+					TELEGRAM_STATE: {
+						get: getSpy,
+						put: putSpy,
+					} as unknown as KVNamespace,
+				} as Env,
+				ctx,
+			);
+			await waitOnExecutionContext(ctx);
+
+			expect(sendMessages[0]).toContain("Отправьте текст большой задачи");
+			expect(sendMessages[1]).toBe("Выберите доску для создания задач:");
+			expect(sendMessages[2]).toContain("Создал задачи:");
+			expect(sendMessages[2]).toContain("Сделать backend API");
+			expect(mockSupabaseState.insertedTasks.length).toBe(2);
+			expect(mockSupabaseState.insertedTasks[0]?.board_id).toBe(
+				"11111111-1111-4111-8111-111111111111",
+			);
+			expect(mockSupabaseState.insertedTasks[1]?.title).toBe("Покрыть backend API тестами");
+			expect(putSpy).toHaveBeenCalledWith("telegram_polling_offset", "13");
 		} finally {
 			globalThis.fetch = originalFetch;
 		}

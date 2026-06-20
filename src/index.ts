@@ -35,11 +35,27 @@ type TelegramApiResponse<T> = {
 	description?: string;
 	error_code?: number;
 };
+type TaskAssignment = {
+	task: string;
+	assignee: { id: string; full_name: string | null; team_role: string | null };
+	task_id: string;
+};
+type CreateTasksResult =
+	| { assignments: TaskAssignment[] }
+	| { error: string; status: number; details?: string };
+type TelegramCreateState =
+	| { mode: "idle" }
+	| { mode: "awaiting_task_text" }
+	| { mode: "awaiting_board_selection"; taskText: string };
 
 const UUID_REGEX =
 	/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const TELEGRAM_OFFSET_KEY = "telegram_polling_offset";
 const TELEGRAM_GET_BOARDS_BUTTON = "boards";
+const TELEGRAM_CREATE_TASKS_BUTTON = "создание задач";
+const TELEGRAM_GET_BOARDS_PREFIX = "board:";
+const TELEGRAM_CREATE_TASKS_PREFIX = "create_tasks_board:";
+const TELEGRAM_CHAT_STATE_PREFIX = "telegram_chat_state:";
 
 const ROLE_KEYWORDS: Array<{ keywords: string[]; roles: string[] }> = [
 	{ keywords: ["api", "backend", "server", "db", "database"], roles: ["backend"] },
@@ -124,7 +140,7 @@ async function callTelegramApi<T>(
 
 function getTelegramKeyboard(): { keyboard: Array<Array<{ text: string }>>; resize_keyboard: boolean } {
 	return {
-		keyboard: [[{ text: TELEGRAM_GET_BOARDS_BUTTON }]],
+		keyboard: [[{ text: TELEGRAM_GET_BOARDS_BUTTON }, { text: TELEGRAM_CREATE_TASKS_BUTTON }]],
 		resize_keyboard: true,
 	};
 }
@@ -164,12 +180,227 @@ async function loadBoards(
 
 function getBoardsInlineKeyboard(
 	boards: Array<{ id: string; name: string }>,
+	callbackPrefix = TELEGRAM_GET_BOARDS_PREFIX,
 ): { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> } {
 	return {
 		inline_keyboard: boards.map((board) => [
-			{ text: board.name, callback_data: `board:${board.id}` },
+			{ text: board.name, callback_data: `${callbackPrefix}${board.id}` },
 		]),
 	};
+}
+
+function getTelegramChatStateKey(chatId: number): string {
+	return `${TELEGRAM_CHAT_STATE_PREFIX}${chatId}`;
+}
+
+async function loadTelegramCreateState(
+	stateStore: KVNamespace | undefined,
+	chatId: number,
+): Promise<TelegramCreateState> {
+	if (!stateStore) {
+		return { mode: "idle" };
+	}
+
+	const raw = await stateStore.get(getTelegramChatStateKey(chatId));
+	if (!raw) {
+		return { mode: "idle" };
+	}
+
+	try {
+		const parsed = JSON.parse(raw) as TelegramCreateState;
+		if (
+			parsed.mode === "idle" ||
+			parsed.mode === "awaiting_task_text" ||
+			(parsed.mode === "awaiting_board_selection" && typeof parsed.taskText === "string")
+		) {
+			return parsed;
+		}
+	} catch {
+		// Fallback to idle when state cannot be parsed.
+	}
+
+	return { mode: "idle" };
+}
+
+async function saveTelegramCreateState(
+	stateStore: KVNamespace | undefined,
+	chatId: number,
+	state: TelegramCreateState,
+): Promise<void> {
+	if (!stateStore) {
+		return;
+	}
+
+	await stateStore.put(getTelegramChatStateKey(chatId), JSON.stringify(state));
+}
+
+async function createTaskAssignments(
+	env: Env & {
+		OPENROUTER_API_KEY?: string;
+		SUPABASE_URL?: string;
+		SUPABASE_SERVICE_ROLE_KEY?: string;
+	},
+	message: string,
+	boardId: string,
+): Promise<CreateTasksResult> {
+	const apiKey = env.OPENROUTER_API_KEY;
+	const supabaseUrl = env.SUPABASE_URL;
+	const supabaseServiceRoleKey = env.SUPABASE_SERVICE_ROLE_KEY;
+	if (!apiKey) {
+		return { error: "OPENROUTER_API_KEY is not set", status: 500 };
+	}
+	if (!supabaseUrl || !supabaseServiceRoleKey) {
+		return { error: "SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is not set", status: 500 };
+	}
+
+	const llmResponse = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+		method: "POST",
+		headers: {
+			Authorization: `Bearer ${apiKey}`,
+			"Content-Type": "application/json",
+		},
+		body: JSON.stringify({
+			model: "deepseek/deepseek-v4-pro",
+			messages: [
+				{
+					role: "system",
+					content:
+						'Ты разбиваешь большую задачу на подзадачи. Верни только валидный JSON-массив объектов формата [{"task":"..."}]. Без markdown, без пояснений, без дополнительного текста. От 4 до 10 подзадач. Каждая подзадача должна быть конкретной и выполнимой.',
+				},
+				{
+					role: "user",
+					content: message,
+				},
+			],
+		}),
+	});
+
+	if (!llmResponse.ok) {
+		const errorText = await llmResponse.text();
+		return {
+			error: "OpenRouter request failed",
+			status: 502,
+			details: errorText,
+		};
+	}
+
+	const data = await llmResponse.json<{
+		choices?: Array<{ message?: { content?: string } }>;
+	}>();
+	const reply = data.choices?.[0]?.message?.content?.trim();
+	if (!reply) {
+		return { error: "Model returned empty response", status: 502 };
+	}
+
+	let parsedTasks: unknown;
+	try {
+		parsedTasks = JSON.parse(reply);
+	} catch {
+		return {
+			error: "Model returned invalid JSON format",
+			status: 502,
+			details: reply,
+		};
+	}
+
+	if (!Array.isArray(parsedTasks)) {
+		return {
+			error: "Model response must be an array of tasks",
+			status: 502,
+			details: reply,
+		};
+	}
+
+	const tasks: ParsedTask[] = [];
+	for (const item of parsedTasks) {
+		if (
+			typeof item !== "object" ||
+			item === null ||
+			!("task" in item) ||
+			typeof item.task !== "string" ||
+			!item.task.trim()
+		) {
+			return {
+				error: "Each task item must be an object with a non-empty string field 'task'",
+				status: 502,
+				details: reply,
+			};
+		}
+
+		tasks.push({ task: item.task.trim() });
+	}
+
+	const supabase = createClient(supabaseUrl, supabaseServiceRoleKey, {
+		auth: { persistSession: false },
+	});
+	const { data: profiles, error: profilesError } = await supabase
+		.from("profiles")
+		.select("id, full_name, team_role");
+	if (profilesError) {
+		return {
+			error: "Failed to fetch users from Supabase",
+			status: 502,
+			details: profilesError.message,
+		};
+	}
+
+	const { data: boardMembers, error: membersError } = await supabase
+		.from("board_members")
+		.select("user_id")
+		.eq("board_id", boardId);
+	if (membersError) {
+		return {
+			error: "Failed to fetch board members from Supabase",
+			status: 502,
+			details: membersError.message,
+		};
+	}
+
+	const allProfiles = (profiles ?? []) as Profile[];
+	const memberIds = new Set((boardMembers ?? []).map((member) => member.user_id));
+	const candidates =
+		memberIds.size > 0 ? allProfiles.filter((profile) => memberIds.has(profile.id)) : allProfiles;
+	if (candidates.length === 0) {
+		return { error: "No available users for task assignment", status: 400 };
+	}
+
+	const assignments: TaskAssignment[] = [];
+	let fallbackIndex = 0;
+	for (const task of tasks) {
+		const assignee = pickAssignee(task.task, candidates, fallbackIndex);
+		fallbackIndex += 1;
+
+		const { data: insertedTask, error: insertError } = await supabase
+			.from("tasks")
+			.insert({
+				board_id: boardId,
+				title: task.task,
+				status: "todo",
+				priority: "medium",
+				assignee_id: assignee.id,
+			})
+			.select("id")
+			.single();
+		if (insertError || !insertedTask) {
+			return {
+				error: "Failed to persist task assignment",
+				status: 502,
+				details: insertError?.message ?? "Unknown insert error",
+			};
+		}
+
+		assignments.push({
+			task: task.task,
+			assignee: {
+				id: assignee.id,
+				full_name: assignee.full_name,
+				team_role: assignee.team_role,
+			},
+			task_id: insertedTask.id,
+		});
+	}
+
+	return { assignments };
 }
 
 async function listBoardTasksMessage(
@@ -221,15 +452,73 @@ async function sendTelegramMessage(
 async function respondToTelegramUpdate(
 	botToken: string,
 	update: TelegramUpdate,
-	env: Env & { SUPABASE_URL?: string; SUPABASE_SERVICE_ROLE_KEY?: string },
+	env: Env & {
+		OPENROUTER_API_KEY?: string;
+		SUPABASE_URL?: string;
+		SUPABASE_SERVICE_ROLE_KEY?: string;
+		TELEGRAM_STATE?: KVNamespace;
+	},
 ): Promise<void> {
+	const stateStore = env.TELEGRAM_STATE;
 	const callbackQueryId = update.callback_query?.id;
 	const callbackChatId = update.callback_query?.message?.chat?.id;
 	const callbackData = update.callback_query?.data?.trim();
-	if (typeof callbackChatId === "number" && callbackData?.startsWith("board:")) {
-		const boardId = callbackData.slice("board:".length);
+	if (typeof callbackChatId === "number" && callbackData?.startsWith(TELEGRAM_GET_BOARDS_PREFIX)) {
+		const boardId = callbackData.slice(TELEGRAM_GET_BOARDS_PREFIX.length);
 		const tasksMessage = await listBoardTasksMessage(env, boardId);
 		await sendTelegramMessage(botToken, callbackChatId, tasksMessage, getTelegramKeyboard());
+		if (callbackQueryId) {
+			await callTelegramApi(botToken, "answerCallbackQuery", {
+				callback_query_id: callbackQueryId,
+			});
+		}
+		return;
+	}
+	if (typeof callbackChatId === "number" && callbackData?.startsWith(TELEGRAM_CREATE_TASKS_PREFIX)) {
+		const boardId = callbackData.slice(TELEGRAM_CREATE_TASKS_PREFIX.length);
+		const state = await loadTelegramCreateState(stateStore, callbackChatId);
+		if (state.mode !== "awaiting_board_selection") {
+			await sendTelegramMessage(
+				botToken,
+				callbackChatId,
+				"Сначала нажмите кнопку создание задач и отправьте текст задачи.",
+				getTelegramKeyboard(),
+			);
+		} else if (!isUuid(boardId)) {
+			await sendTelegramMessage(
+				botToken,
+				callbackChatId,
+				"Некорректная доска. Запустите создание задач заново.",
+				getTelegramKeyboard(),
+			);
+			await saveTelegramCreateState(stateStore, callbackChatId, { mode: "idle" });
+		} else {
+			const creationResult = await createTaskAssignments(env, state.taskText, boardId);
+			if ("error" in creationResult) {
+				const detailsPart = creationResult.details ? `\nДетали: ${creationResult.details}` : "";
+				await sendTelegramMessage(
+					botToken,
+					callbackChatId,
+					`Не удалось создать задачи.\nОшибка: ${creationResult.error}${detailsPart}`,
+					getTelegramKeyboard(),
+				);
+			} else {
+				const lines = creationResult.assignments.map((assignment, index) => {
+					const assigneeName =
+						assignment.assignee.full_name ??
+						assignment.assignee.team_role ??
+						assignment.assignee.id;
+					return `${index + 1}. ${assignment.task} -> ${assigneeName}`;
+				});
+				await sendTelegramMessage(
+					botToken,
+					callbackChatId,
+					`Создал задачи:\n${lines.join("\n")}`,
+					getTelegramKeyboard(),
+				);
+			}
+			await saveTelegramCreateState(stateStore, callbackChatId, { mode: "idle" });
+		}
 		if (callbackQueryId) {
 			await callTelegramApi(botToken, "answerCallbackQuery", {
 				callback_query_id: callbackQueryId,
@@ -244,13 +533,59 @@ async function respondToTelegramUpdate(
 	}
 
 	const normalizedText = update.message?.text?.trim();
+	const telegramState = await loadTelegramCreateState(stateStore, chatId);
 	const wantsBoards =
 		normalizedText === TELEGRAM_GET_BOARDS_BUTTON || normalizedText === "/boards";
+	const wantsTaskCreation =
+		normalizedText === TELEGRAM_CREATE_TASKS_BUTTON || normalizedText === "/create_tasks";
+	if (wantsTaskCreation) {
+		if (!stateStore) {
+			await sendTelegramMessage(
+				botToken,
+				chatId,
+				"Сценарий создания задач недоступен: не настроен TELEGRAM_STATE.",
+				getTelegramKeyboard(),
+			);
+			return;
+		}
+		await saveTelegramCreateState(stateStore, chatId, { mode: "awaiting_task_text" });
+		await sendTelegramMessage(
+			botToken,
+			chatId,
+			"Отправьте текст большой задачи. После этого я предложу выбрать доску.",
+			getTelegramKeyboard(),
+		);
+		return;
+	}
+	if (telegramState.mode === "awaiting_task_text" && normalizedText) {
+		await saveTelegramCreateState(stateStore, chatId, {
+			mode: "awaiting_board_selection",
+			taskText: normalizedText,
+		});
+		const { boards, error } = await loadBoards(env);
+		if (error) {
+			await sendTelegramMessage(botToken, chatId, error, getTelegramKeyboard());
+			await saveTelegramCreateState(stateStore, chatId, { mode: "idle" });
+			return;
+		}
+		if (boards.length === 0) {
+			await sendTelegramMessage(botToken, chatId, "В базе пока нет досок.", getTelegramKeyboard());
+			await saveTelegramCreateState(stateStore, chatId, { mode: "idle" });
+			return;
+		}
+		await sendTelegramMessage(
+			botToken,
+			chatId,
+			"Выберите доску для создания задач:",
+			getBoardsInlineKeyboard(boards, TELEGRAM_CREATE_TASKS_PREFIX),
+		);
+		return;
+	}
 	if (!wantsBoards) {
 		await sendTelegramMessage(
 			botToken,
 			chatId,
-			"Нажмите кнопку boards, чтобы получить список досок.",
+			"Нажмите кнопку boards для списка досок или создание задач для генерации подзадач.",
 			getTelegramKeyboard(),
 		);
 		return;
@@ -270,7 +605,7 @@ async function respondToTelegramUpdate(
 		botToken,
 		chatId,
 		"Выберите доску:",
-		getBoardsInlineKeyboard(boards),
+		getBoardsInlineKeyboard(boards, TELEGRAM_GET_BOARDS_PREFIX),
 	);
 }
 
@@ -343,11 +678,7 @@ export default {
 			}
 
 			ctx.waitUntil(
-				respondToTelegramUpdate(
-					botToken,
-					update,
-					env as Env & { SUPABASE_URL?: string; SUPABASE_SERVICE_ROLE_KEY?: string },
-				).catch((error) => {
+				respondToTelegramUpdate(botToken, update, env as Env).catch((error) => {
 					console.error("Failed to send webhook reply:", error);
 				}),
 			);
@@ -356,23 +687,6 @@ export default {
 		}
 
 		if (request.method === "POST" && url.pathname === "/chat") {
-			const apiKey = (env as Env & { OPENROUTER_API_KEY?: string }).OPENROUTER_API_KEY;
-			const supabaseUrl = (env as Env & { SUPABASE_URL?: string }).SUPABASE_URL;
-			const supabaseServiceRoleKey = (env as Env & { SUPABASE_SERVICE_ROLE_KEY?: string })
-				.SUPABASE_SERVICE_ROLE_KEY;
-			if (!apiKey) {
-				return Response.json(
-					{ error: "OPENROUTER_API_KEY is not set" },
-					{ status: 500 },
-				);
-			}
-			if (!supabaseUrl || !supabaseServiceRoleKey) {
-				return Response.json(
-					{ error: "SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is not set" },
-					{ status: 500 },
-				);
-			}
-
 			let body: { message?: string; board_id?: string };
 			try {
 				body = await request.json<{ message?: string; board_id?: string }>();
@@ -404,186 +718,15 @@ export default {
 				);
 			}
 
-			const llmResponse = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-				method: "POST",
-				headers: {
-					Authorization: `Bearer ${apiKey}`,
-					"Content-Type": "application/json",
-				},
-				body: JSON.stringify({
-					model: "deepseek/deepseek-v4-pro",
-					messages: [
-						{
-							role: "system",
-							content:
-								'Ты разбиваешь большую задачу на подзадачи. Верни только валидный JSON-массив объектов формата [{"task":"..."}]. Без markdown, без пояснений, без дополнительного текста. От 4 до 10 подзадач. Каждая подзадача должна быть конкретной и выполнимой.',
-						},
-						{
-							role: "user",
-							content: message,
-						},
-					],
-				}),
-			});
-
-			if (!llmResponse.ok) {
-				const errorText = await llmResponse.text();
-				return Response.json(
-					{
-						error: "OpenRouter request failed",
-						status: llmResponse.status,
-						details: errorText,
-					},
-					{ status: 502 },
-				);
-			}
-
-			const data = await llmResponse.json<{
-				choices?: Array<{ message?: { content?: string } }>;
-			}>();
-			const reply = data.choices?.[0]?.message?.content?.trim();
-
-			if (!reply) {
-				return Response.json(
-					{ error: "Model returned empty response" },
-					{ status: 502 },
-				);
-			}
-
-			let parsedTasks: unknown;
-			try {
-				parsedTasks = JSON.parse(reply);
-			} catch {
-				return Response.json(
-					{
-						error: "Model returned invalid JSON format",
-						details: reply,
-					},
-					{ status: 502 },
-				);
-			}
-
-			if (!Array.isArray(parsedTasks)) {
-				return Response.json(
-					{
-						error: "Model response must be an array of tasks",
-						details: reply,
-					},
-					{ status: 502 },
-				);
-			}
-
-			const tasks: ParsedTask[] = [];
-			for (const item of parsedTasks) {
-				if (
-					typeof item !== "object" ||
-					item === null ||
-					!("task" in item) ||
-					typeof item.task !== "string" ||
-					!item.task.trim()
-				) {
-					return Response.json(
-						{
-							error: "Each task item must be an object with a non-empty string field 'task'",
-							details: reply,
-						},
-						{ status: 502 },
-					);
+			const result = await createTaskAssignments(env as Env, message, boardId);
+			if ("error" in result) {
+				const bodyToReturn: { error: string; details?: string } = { error: result.error };
+				if (result.details) {
+					bodyToReturn.details = result.details;
 				}
-
-				tasks.push({ task: item.task.trim() });
+				return Response.json(bodyToReturn, { status: result.status });
 			}
-
-			const supabase = createClient(supabaseUrl, supabaseServiceRoleKey, {
-				auth: { persistSession: false },
-			});
-
-			const { data: profiles, error: profilesError } = await supabase
-				.from("profiles")
-				.select("id, full_name, team_role");
-			if (profilesError) {
-				return Response.json(
-					{
-						error: "Failed to fetch users from Supabase",
-						details: profilesError.message,
-					},
-					{ status: 502 },
-				);
-			}
-
-			const { data: boardMembers, error: membersError } = await supabase
-				.from("board_members")
-				.select("user_id")
-				.eq("board_id", boardId);
-			if (membersError) {
-				return Response.json(
-					{
-						error: "Failed to fetch board members from Supabase",
-						details: membersError.message,
-					},
-					{ status: 502 },
-				);
-			}
-
-			const allProfiles = (profiles ?? []) as Profile[];
-			const memberIds = new Set((boardMembers ?? []).map((member) => member.user_id));
-			const candidates =
-				memberIds.size > 0
-					? allProfiles.filter((profile) => memberIds.has(profile.id))
-					: allProfiles;
-
-			if (candidates.length === 0) {
-				return Response.json(
-					{ error: "No available users for task assignment" },
-					{ status: 400 },
-				);
-			}
-
-			const assignments: Array<{
-				task: string;
-				assignee: { id: string; full_name: string | null; team_role: string | null };
-				task_id: string;
-			}> = [];
-			let fallbackIndex = 0;
-
-			for (const task of tasks) {
-				const assignee = pickAssignee(task.task, candidates, fallbackIndex);
-				fallbackIndex += 1;
-
-				const { data: insertedTask, error: insertError } = await supabase
-					.from("tasks")
-					.insert({
-						board_id: boardId,
-						title: task.task,
-						status: "todo",
-						priority: "medium",
-						assignee_id: assignee.id,
-					})
-					.select("id")
-					.single();
-
-				if (insertError || !insertedTask) {
-					return Response.json(
-						{
-							error: "Failed to persist task assignment",
-							details: insertError?.message ?? "Unknown insert error",
-						},
-						{ status: 502 },
-					);
-				}
-
-				assignments.push({
-					task: task.task,
-					assignee: {
-						id: assignee.id,
-						full_name: assignee.full_name,
-						team_role: assignee.team_role,
-					},
-					task_id: insertedTask.id,
-				});
-			}
-
-			return Response.json({ assignments });
+			return Response.json({ assignments: result.assignments });
 		}
 
 		return new Response("Hello World!");
